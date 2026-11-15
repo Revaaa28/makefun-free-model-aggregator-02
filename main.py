@@ -1286,6 +1286,198 @@ def failures_header(failures: list[Json]) -> str | None:
     return json.dumps(failures[:8], separators=(',', ':'), ensure_ascii=False)
 
 
+# ---------------------------------------------------------------- the offline self-test
+#
+# `python3 main.py --selftest`: a deterministic, network-free check of the
+# pieces a live trial depends on — the catalog, the candidate ranking and
+# refusal demotion, the Anthropic <-> OpenAI translation, the answer checks
+# and the stream normaliser. It runs only when asked for on the command
+# line; the serving path never calls it.
+
+
+def _selftest_assert(condition, message):
+    if not condition:
+        raise AssertionError("selftest: " + message)
+
+
+def _selftest_catalog():
+    models = free_models(BRIEF)
+    ids = [model["id"] for model in models]
+    _selftest_assert(len(ids) == 14, "the catalog holds 14 models")
+    _selftest_assert(len(set(ids)) == 14, "the catalog ids are unique")
+    for model in models:
+        _selftest_assert(capabilities_of(model)["tools"] is True,
+                         "every catalog model serves tools: " + model["id"])
+        _selftest_assert(model["rating_milli"] > 0,
+                         "every catalog model is rated: " + model["id"])
+    provider = CATALOG["providers"][0]
+    _selftest_assert(provider["id"] == "openrouter", "the provider is openrouter")
+    _selftest_assert(provider["base_url"] == "https://openrouter.ai/api/v1",
+                     "the provider names the public base url, never the gateway")
+    _selftest_assert(provider["key_env"] == "OPENROUTER_API_KEY",
+                     "the provider names the key env var")
+    _selftest_assert(provider["wire"] == "openai", "the provider wire is openai")
+    listed = [row["id"] for row in provider["models"]]
+    _selftest_assert(listed == ids, "--list prints the catalog in order")
+    served = [row["id"] for row in served_models()]
+    _selftest_assert(served == ids, "GET /v1/models names the same models")
+
+
+def _selftest_candidates():
+    json_first = candidates_for({"json": True})[0]["id"]
+    _selftest_assert(json_first == "openrouter/nvidia/nemotron-3.5-super-vl:free",
+                     "a json prompt leads with the best json-capable model")
+    plain_first = candidates_for({})[0]["id"]
+    _selftest_assert(plain_first == "openrouter/thinkingmachines/inkling-2-small:free",
+                     "an unconstrained prompt leads with the best rated model")
+    for requires in ({"json": True}, {}, {"tools": True}):
+        for model in candidates_for(requires):
+            _selftest_assert(meets_requirements(requires, capabilities_of(model)),
+                             "candidates meet the requirements they were picked for")
+    note_refusal(plain_first)
+    try:
+        demoted = [model["id"] for model in candidates_for({})]
+        _selftest_assert(demoted[0] != plain_first,
+                         "a refused model is demoted below every unrefused one")
+        _selftest_assert(demoted[-1] == plain_first,
+                         "the refused model sorts last among equals")
+    finally:
+        with refused_lock:
+            refused_models.clear()
+    tools_body = {"tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+                  "messages": [{"role": "user", "content": "hi"}]}
+    _selftest_assert(requirements_from_body(tools_body)["tools"] is True,
+                     "a body carrying tools requires tool support")
+    json_body = {"response_format": {"type": "json_object"},
+                 "messages": [{"role": "user", "content": "hi"}]}
+    _selftest_assert(requirements_from_body(json_body)["json"] is True,
+                     "a json_object body requires json support")
+    plain_body = {"messages": [{"role": "user", "content": "hi"}]}
+    plain = requirements_from_body(plain_body)
+    _selftest_assert(plain == {"tools": False, "vision": False, "json": False},
+                     "a plain body requires nothing extra")
+
+
+def _selftest_translation():
+    anthropic_body = {
+        "model": "auto",
+        "system": "Answer with the token MFK-101 in the text.",
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [{"name": "lookup", "description": "look up",
+                   "input_schema": {"type": "object",
+                                    "properties": {"q": {"type": "string"}}}}],
+        "max_tokens": 64,
+    }
+    dialled = anthropic_to_openai(anthropic_body, "openrouter/nvidia/nemotron-3.5-super-vl:free")
+    _selftest_assert(dialled["messages"][0]["role"] == "system",
+                     "the system prompt becomes the first message")
+    _selftest_assert(dialled["tools"][0]["type"] == "function",
+                     "tools are wrapped as functions")
+    _selftest_assert(dialled["tools"][0]["function"]["name"] == "lookup",
+                     "the tool name survives translation")
+    answer = {
+        "id": "chatcmpl-selftest", "object": "chat.completion", "created": 0,
+        "model": "nvidia/nemotron-3.5-super-vl:free",
+        "choices": [{"index": 0,
+                     "message": {"role": "assistant",
+                                 "content": "the token is MFK-101",
+                                 "tool_calls": [{
+                                     "id": "call_1", "type": "function",
+                                     "function": {"name": "lookup",
+                                                  "arguments": "{\"q\": \"x\"}"}}]},
+                     "finish_reason": "tool_calls"}],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 9, "total_tokens": 21},
+    }
+    back = openai_to_anthropic(answer, "openrouter/nvidia/nemotron-3.5-super-vl:free")
+    kinds = [block["type"] for block in back["content"]]
+    _selftest_assert(kinds == ["text", "tool_use"],
+                     "the answer translates back to text and tool_use blocks")
+    _selftest_assert(back["stop_reason"] == "tool_use",
+                     "the stop reason maps to tool_use")
+    _selftest_assert(back["usage"] == {"input_tokens": 12, "output_tokens": 9},
+                     "usage translates field for field")
+    _selftest_assert(back["model"].startswith("openrouter/"),
+                     "the answer names the dialled model id")
+
+
+def _selftest_answer_checks():
+    token = expected_token({"messages": [
+        {"role": "system", "content": "name the token MFK-202 please"},
+        {"role": "user", "content": "go"}]})
+    _selftest_assert(token == "MFK-202", "the expected token is read off the prompt")
+    _selftest_assert(expected_token({"messages": []}) is None,
+                     "a prompt without a token expects none")
+    good = {"choices": [{"message": {"content": "MFK-202"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1}}
+    parsed = parse_answer(json.dumps(good))
+    _selftest_assert(parsed is not None and parsed["choices"][0]["message"]["content"] == "MFK-202",
+                     "a provider answer parses as one JSON object")
+    _selftest_assert(parse_answer("this is not json") is None,
+                     "a non-JSON answer does not parse")
+    _selftest_assert(answer_usage_ok(good), "a whole usage count passes")
+    bad_usage = {"choices": [{"message": {"content": "MFK-202"},
+                              "finish_reason": "stop"}],
+                 "usage": {"prompt_tokens": 3}}
+    _selftest_assert(not answer_usage_ok(bad_usage),
+                     "an answer without output usage is not whole")
+    capped = with_output_cap({"model": "auto", "messages": []})
+    _selftest_assert(capped["max_tokens"] == DEFAULT_MAX_TOKENS,
+                     "an uncapped request gains the default cap")
+    over = with_output_cap({"max_tokens": 99999})
+    _selftest_assert(over["max_tokens"] == GATEWAY_MAX_TOKENS,
+                     "a request over the gateway cap is clamped to it")
+
+
+def _selftest_stream_normaliser():
+    def sse(delta, finish=None, usage=None):
+        row = {"id": "chatcmpl-selftest", "object": "chat.completion.chunk",
+               "created": 0, "model": "openrouter/x/y:free",
+               "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        if usage is not None:
+            row["usage"] = usage
+        return "data: " + json.dumps(row) + "\n\n"
+
+    raw = (
+        sse({"role": "assistant", "content": ""})
+        + sse({"content": "the token is MFK-"})
+        + sse({"content": "303"})
+        + sse({}, finish="stop", usage={"prompt_tokens": 5, "completion_tokens": 4})
+        + sse({}, finish="stop")
+        + "data: [DONE]\n\n"
+    ).encode("utf-8")
+    _selftest_assert(stream_text([raw]) == "the token is MFK-303",
+                     "stream text is assembled across deltas")
+    frames = []
+    for frame in normalize_stream_chunks([raw]):
+        text = frame.decode("utf-8").strip()
+        _selftest_assert(text.startswith("data: "), "every frame is an SSE data frame")
+        payload = text[len("data: "):]
+        if payload != "[DONE]":
+            frames.append(json.loads(payload))
+    finishes = [f for f in frames
+                if f["choices"] and f["choices"][0].get("finish_reason")]
+    _selftest_assert(len(finishes) == 1,
+                     "a doubled finish chunk is normalised to exactly one")
+    usage_frames = [f for f in frames if not f["choices"] and "usage" in f]
+    _selftest_assert(len(usage_frames) == 1
+                     and usage_frames[0]["usage"]["completion_tokens"] == 4,
+                     "the usage rides its own trailing chunk")
+    contents = [f for f in frames
+                if f["choices"] and f["choices"][0]["delta"].get("content")]
+    _selftest_assert(len(contents) == 2, "content frames pass through untouched")
+
+
+def run_selftest():
+    _selftest_catalog()
+    _selftest_candidates()
+    _selftest_translation()
+    _selftest_answer_checks()
+    _selftest_stream_normaliser()
+    print("selftest: all checks passed "
+          "(catalog, candidates, translation, answer checks, stream normaliser)")
+
+
 # ---------------------------------------------------------------- the HTTP server
 
 
@@ -1528,6 +1720,12 @@ def start() -> None:
         # before any server starts. A process whose stdout is not flushed loses the tail, so flush it.
         sys.stdout.write(json.dumps(CATALOG, separators=(',', ':'), ensure_ascii=False) + '\n')
         sys.stdout.flush()
+        return
+    if '--selftest' in sys.argv[1:]:
+        # The offline self-test: no server, no network, no clock. It exercises the
+        # catalog, the ranking, the translators and the stream normaliser against
+        # fabricated answers and exits 0 only if every check holds.
+        run_selftest()
         return
     if ENV_URL == '':
         raise RuntimeError('MAKEFUN_ENV_URL is not set')
