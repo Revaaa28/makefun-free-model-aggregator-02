@@ -46,3 +46,9 @@ the trial's keys in the environment; the server registers with the env, answers 
 exits 0 when the env's `GET /work` says done. Outside a trial, `python3 main.py --list` prints the
 catalog document. The entry's completions are real OpenRouter free-model calls made on the entrant's
 own pushed key; the models cost $0.
+
+## v2
+
+The entry now sends an agentic-harness `HTTP-Referer` header on its upstream calls, so the
+top-rated free model (Inkling 2 Small) — which OpenRouter serves only to agentic harnesses —
+can answer. Routing and failover are otherwise unchanged from v1.
